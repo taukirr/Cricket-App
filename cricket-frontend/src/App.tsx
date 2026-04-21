@@ -1,179 +1,390 @@
-import { useState } from "react";
-import ScoreBoard from "./components/ScoreBoard";
-import Controls from "./components/Controls";
-import BallTimeline from "./components/BallTimeLine";
-import MatchHeader from "./components/MatchHeader";
-import SetupForm from "./components/SetupForm";
-import type {
-  BallEvent,
-  BallType,
-  MatchConfig,
-  MatchSnapshot,
-} from "./types/match";
+import { useEffect, useMemo, useState } from "react";
+import AuthPanel from "./components/AuthPanel";
+import DashboardPanel from "./components/DashboardPanel";
+import MatchLivePanel from "./components/MatchLivePanel";
+import MatchSetupPanel from "./components/MatchSetupPanel";
+import SharedMatchView from "./components/SharedMatchView";
+import {
+  fetchMatches,
+  fetchSharedMatch,
+  getCurrentSession,
+  loginUser,
+  logoutUser,
+  registerUser,
+  saveMatch,
+  subscribeToAuthChanges,
+} from "./services/api";
+import type { MatchRecord, MatchSetupInput, ThemeMode, UserSession } from "./types/cricket";
+import { createMatchFromSetup } from "./utils/matchEngine";
+import { buildLocalPlayerStats, buildLocalTeamStats } from "./utils/stats";
+import {
+  createInitialStorageState,
+  loadStorageState,
+  saveStorageState,
+} from "./utils/storage";
+
+type AppMode = "dashboard" | "setup" | "live";
+
+function mergeMatches(localMatches: MatchRecord[], remoteMatches: MatchRecord[]) {
+  const matchMap = new Map<string, MatchRecord>();
+
+  [...remoteMatches, ...localMatches].forEach((match) => {
+    const existingMatch = matchMap.get(match.id);
+
+    if (!existingMatch || new Date(match.updatedAt) > new Date(existingMatch.updatedAt)) {
+      matchMap.set(match.id, match);
+    }
+  });
+
+  return Array.from(matchMap.values()).sort(
+    (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
+  );
+}
+
+function upsertMatch(matches: MatchRecord[], nextMatch: MatchRecord) {
+  const filteredMatches = matches.filter((match) => match.id !== nextMatch.id);
+
+  return [nextMatch, ...filteredMatches].sort(
+    (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()
+  );
+}
+
+function getThemeClasses(theme: ThemeMode) {
+  if (theme === "light") {
+    return "min-h-screen bg-[radial-gradient(circle_at_top_left,_#ecfeff,_#ffffff_35%,_#dbeafe_100%)] text-slate-950";
+  }
+
+  return "min-h-screen bg-[radial-gradient(circle_at_top_left,_#164e63,_#020617_35%,_#020617_100%)] text-white";
+}
 
 export default function App() {
-  const [team1, setTeam1] = useState("Team 1");
-  const [team2, setTeam2] = useState("Team 2");
-  const [oversLimit, setOversLimit] = useState(10);
-  const [battingSide, setBattingSide] = useState<"team1" | "team2">("team1");
-  const [setupStep, setSetupStep] = useState(1);
+  const [storageState, setStorageState] = useState(loadStorageState);
+  const [mode, setMode] = useState<AppMode>(storageState.activeMatch ? "live" : "dashboard");
+  const [setupSeed, setSetupSeed] = useState<MatchRecord | null>(null);
+  const [remoteMatches, setRemoteMatches] = useState<MatchRecord[]>([]);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [sharedMatch, setSharedMatch] = useState<MatchRecord | null>(null);
+  const [sharedError, setSharedError] = useState("");
 
-  const [matchConfig, setMatchConfig] = useState<MatchConfig | null>(null);
-  const [score, setScore] = useState(0);
-  const [wickets, setWickets] = useState(0);
-  const [balls, setBalls] = useState(0);
-  const [overs, setOvers] = useState(0);
-  const [ballHistory, setBallHistory] = useState<BallEvent[]>([]);
-  const [history, setHistory] = useState<MatchSnapshot[]>([]);
+  useEffect(() => {
+    saveStorageState(storageState);
+  }, [storageState]);
 
-  const resetScoreboard = () => {
-    setScore(0);
-    setWickets(0);
-    setBalls(0);
-    setOvers(0);
-    setBallHistory([]);
-    setHistory([]);
-  };
+  useEffect(() => {
+    let isMounted = true;
 
-  const startMatch = () => {
-    setMatchConfig({
-      team1: team1.trim() || "Team 1",
-      team2: team2.trim() || "Team 2",
-      totalOvers: oversLimit,
-      battingTeam: battingSide,
+    getCurrentSession()
+      .then((session) => {
+        if (!isMounted) {
+          return;
+        }
+
+        setStorageState((currentState) => ({
+          ...currentState,
+          session,
+        }));
+      })
+      .catch((error) => {
+        setStatusMessage(error instanceof Error ? error.message : "Unable to read session");
+      });
+
+    const subscription = subscribeToAuthChanges((session) => {
+      setStorageState((currentState) => ({
+        ...currentState,
+        session,
+      }));
     });
-    resetScoreboard();
-  };
-  const saveHistory = () => {
-    setHistory((prev) => [
-      ...prev,
-      { score, wickets, balls, overs, ballHistory },
-    ]);
-  };
 
-  const updateBall = (isLegal: boolean) => {
-    if (!isLegal) return;
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
 
-    if (balls === 5) {
-      setOvers((prev) => prev + 1);
-      setBalls(0);
-    } else {
-      setBalls((prev) => prev + 1);
-    }
-  };
+  useEffect(() => {
+    const searchParams = new URLSearchParams(window.location.search);
+    const sharedMatchId = searchParams.get("shared");
 
-  const isMatchComplete =
-    matchConfig !== null && overs === matchConfig.totalOvers && balls === 0 && ballHistory.length > 0;
-
-  const handleBall = (type: BallType, runs: number = 0) => {
-    if (!matchConfig || isMatchComplete) return;
-
-    saveHistory();
-    setBallHistory((prev) => [...prev, { type, runs }]);
-
-    if (type === "run") {
-      setScore((prev) => prev + runs);
-      updateBall(true);
+    if (!sharedMatchId) {
       return;
     }
 
-    if (type === "wicket") {
-      setWickets((prev) => prev + 1);
-      updateBall(true);
+    fetchSharedMatch(sharedMatchId)
+      .then((match) => setSharedMatch(match))
+      .catch((error) => {
+        setSharedError(error instanceof Error ? error.message : "Unable to open shared match");
+      });
+  }, []);
+
+  async function refreshRemoteData() {
+    const matches = await fetchMatches();
+    setRemoteMatches(matches);
+  }
+
+  async function syncLocalMatches(session: UserSession) {
+    for (const match of storageState.localMatches) {
+      await saveMatch(match);
+    }
+
+    if (session) {
+      await refreshRemoteData();
+    }
+  }
+
+  async function handleAuthenticationSuccess(session: UserSession) {
+    setStorageState((currentState) => ({
+      ...currentState,
+      session,
+    }));
+
+    await syncLocalMatches(session);
+    setStatusMessage("Authenticated and synced with Supabase");
+  }
+
+  async function handleLogin(email: string, password: string) {
+    const session = await loginUser(email, password);
+    await handleAuthenticationSuccess(session);
+  }
+
+  async function handleRegister(name: string, email: string, password: string) {
+    const session = await registerUser(name, email, password);
+
+    if (session) {
+      await handleAuthenticationSuccess(session);
       return;
     }
 
-    if (type === "wide") {
-      setScore((prev) => prev + 1 + runs);
-      updateBall(false);
+    setStatusMessage("Account created. Confirm the email in Supabase, then log in.");
+  }
+
+  useEffect(() => {
+    if (!storageState.session) {
       return;
     }
 
-    if (type === "no-ball") {
-      setScore((prev) => prev + 1 + runs);
-      updateBall(false);
+    const timeoutId = window.setTimeout(() => {
+      refreshRemoteData().catch((error) => {
+        setStatusMessage(error instanceof Error ? error.message : "Unable to load dashboard data");
+      });
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [storageState.session]);
+
+  const combinedMatches = useMemo(
+    () => mergeMatches(storageState.localMatches, storageState.session ? remoteMatches : []),
+    [remoteMatches, storageState.localMatches, storageState.session]
+  );
+  const visiblePlayerStats = buildLocalPlayerStats(combinedMatches);
+  const visibleTeamStats = buildLocalTeamStats(combinedMatches);
+
+  async function persistMatch(nextMatch: MatchRecord) {
+    setStorageState((currentState) => ({
+      ...currentState,
+      activeMatch: nextMatch,
+    }));
+
+    if (nextMatch.status !== "completed") {
+      return;
     }
-  };
 
-  const handleUndo = () => {
-    if (history.length === 0) return;
+    setStorageState((currentState) => ({
+      ...currentState,
+      activeMatch: nextMatch,
+      localMatches: upsertMatch(currentState.localMatches, nextMatch),
+    }));
 
-    const last = history[history.length - 1];
+    if (!storageState.session) {
+      setStatusMessage("Match saved locally");
+      return;
+    }
 
-    setScore(last.score);
-    setWickets(last.wickets);
-    setBalls(last.balls);
-    setOvers(last.overs);
-    setBallHistory(last.ballHistory);
+    try {
+      const savedMatch = await saveMatch(nextMatch);
 
-    setHistory((prev) => prev.slice(0, -1));
-  };
+      setStorageState((currentState) => ({
+        ...currentState,
+        activeMatch: savedMatch,
+        localMatches: upsertMatch(currentState.localMatches, savedMatch),
+      }));
 
-  const handleRestart = () => {
-    resetScoreboard();
-    setMatchConfig(null);
-    setSetupStep(1);
-  };
+      await refreshRemoteData();
+      setStatusMessage("Match saved and synced");
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : "Unable to sync match");
+    }
+  }
 
-  if (!matchConfig) {
-    return (
-      <div className="bg-slate-950 text-white min-h-screen p-6">
-        <div className="max-w-6xl mx-auto">
-          <MatchHeader matchConfig={matchConfig} />
-          <SetupForm
-            step={setupStep}
-            team1={team1}
-            team2={team2}
-            overs={oversLimit}
-            battingTeam={battingSide}
-            onChangeTeam1={setTeam1}
-            onChangeTeam2={setTeam2}
-            onChangeOvers={setOversLimit}
-            onChangeBatting={setBattingSide}
-            onNext={() => setSetupStep((prev) => Math.min(prev + 1, 3))}
-            onBack={() => setSetupStep((prev) => Math.max(prev - 1, 1))}
-            onStart={startMatch}
-          />
-        </div>
-      </div>
-    );
+  function handleCreateMatch(setup: MatchSetupInput) {
+    const nextMatch = createMatchFromSetup(setup);
+
+    setStorageState((currentState) => ({
+      ...currentState,
+      activeMatch: nextMatch,
+      settings: nextMatch.settings,
+    }));
+    setMode("live");
+  }
+
+  function handleMatchChange(nextMatch: MatchRecord) {
+    void persistMatch(nextMatch);
+  }
+
+  function handleCopyShareLink(match: MatchRecord) {
+    if (!match.shareId) {
+      setStatusMessage("Share link becomes available after the match is saved.");
+      return;
+    }
+
+    const shareUrl = `${window.location.origin}?shared=${match.shareId}`;
+    void navigator.clipboard.writeText(shareUrl);
+    setStatusMessage("Share link copied");
+  }
+
+  function handleExportJson(match: MatchRecord) {
+    const blob = new Blob([JSON.stringify(match, null, 2)], {
+      type: "application/json",
+    });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = `${match.id}.json`;
+    anchor.click();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  function handlePlayAgain(match: MatchRecord) {
+    setSetupSeed(match);
+    setMode("setup");
+  }
+
+  function handleResumeMatch() {
+    if (storageState.activeMatch) {
+      setMode("live");
+    }
+  }
+
+  async function handleLogout() {
+    await logoutUser();
+    setStorageState((currentState) => ({
+      ...currentState,
+      session: null,
+    }));
+    setRemoteMatches([]);
+    setStatusMessage("Logged out");
+  }
+
+  function handleCloseSharedMatch() {
+    const searchParams = new URLSearchParams(window.location.search);
+    searchParams.delete("shared");
+    const nextUrl = searchParams.toString()
+      ? `${window.location.pathname}?${searchParams.toString()}`
+      : window.location.pathname;
+
+    window.history.replaceState({}, "", nextUrl);
+    setSharedMatch(null);
+    setSharedError("");
   }
 
   return (
-    <div className="bg-slate-950 text-white min-h-screen p-6">
-      <div className="max-w-6xl mx-auto">
-        <MatchHeader matchConfig={matchConfig} />
+    <div className={getThemeClasses(storageState.theme)}>
+      <div className="mx-auto flex min-h-screen max-w-5xl flex-col px-3 py-4 sm:px-4 lg:px-6">
+        <header className="mb-4 rounded-[1.5rem] border border-white/10 bg-white/5 p-4 backdrop-blur sm:p-5">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.3em] text-cyan-300/70">Simple mobile scorer</p>
+              <h1 className="mt-2 text-3xl font-semibold sm:text-4xl">Cricket Score Counter</h1>
+              <p className="mt-3 max-w-2xl text-sm text-slate-300 sm:text-base">
+                Live scoring, player roles, match history, and Supabase sync in a simpler layout
+                that is easier to use on phones.
+              </p>
+            </div>
 
-        <div className="space-y-6">
-          <ScoreBoard
-            score={score}
-            wickets={wickets}
-            overs={overs}
-            balls={balls}
-            team1={matchConfig.team1}
-            team2={matchConfig.team2}
-            battingTeam={matchConfig.battingTeam}
-            totalOvers={matchConfig.totalOvers}
-          />
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() =>
+                  setStorageState((currentState) => ({
+                    ...currentState,
+                    theme: currentState.theme === "dark" ? "light" : "dark",
+                  }))
+                }
+                className="rounded-full border border-white/10 px-4 py-2 text-sm"
+              >
+                {storageState.theme === "dark" ? "Light theme" : "Dark theme"}
+              </button>
 
-          <BallTimeline balls={ballHistory} />
+              {storageState.session ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleLogout();
+                  }}
+                  className="rounded-full border border-white/10 px-4 py-2 text-sm"
+                >
+                  Logout
+                </button>
+              ) : null}
+            </div>
+          </div>
 
-          <Controls
-            onRun={(run) => handleBall("run", run)}
-            onWicket={() => handleBall("wicket")}
-            onWide={() => handleBall("wide")}
-            onNoBall={() => handleBall("no-ball")}
-            onUndo={handleUndo}
-            onReset={handleRestart}
-          />
-
-          {isMatchComplete ? (
-            <div className="rounded-3xl border border-emerald-500/20 bg-emerald-500/10 p-4 text-emerald-200">
-              <p className="font-semibold">Match complete</p>
-              <p>The innings has finished after {matchConfig.totalOvers} overs.</p>
+          {statusMessage ? (
+            <div className="mt-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
+              {statusMessage}
             </div>
           ) : null}
-        </div>
+        </header>
+
+        {sharedMatch ? (
+          <SharedMatchView match={sharedMatch} onClose={handleCloseSharedMatch} />
+        ) : sharedError ? (
+          <div className="rounded-[1.75rem] border border-red-500/20 bg-red-500/10 p-5 text-red-100">
+            {sharedError}
+          </div>
+        ) : (
+          <div className="grid gap-4">
+            {!storageState.session && mode === "dashboard" ? (
+              <AuthPanel onLogin={handleLogin} onRegister={handleRegister} />
+            ) : null}
+
+            {mode === "dashboard" ? (
+              <DashboardPanel
+                session={storageState.session}
+                activeMatch={storageState.activeMatch}
+                matches={combinedMatches}
+                playerStats={visiblePlayerStats}
+                teamStats={visibleTeamStats}
+                onNewMatch={() => {
+                  setSetupSeed(null);
+                  setMode("setup");
+                }}
+                onResumeMatch={handleResumeMatch}
+                onPlayAgain={handlePlayAgain}
+                onExportJson={handleExportJson}
+                onCopyShareLink={handleCopyShareLink}
+              />
+            ) : null}
+
+            {mode === "setup" ? (
+              <MatchSetupPanel
+                key={setupSeed?.id || "new-match"}
+                initialMatch={setupSeed}
+                defaultSettings={storageState.settings || createInitialStorageState().settings}
+                onStart={handleCreateMatch}
+                onCancel={() => setMode("dashboard")}
+              />
+            ) : null}
+
+            {mode === "live" && storageState.activeMatch ? (
+              <MatchLivePanel
+                match={storageState.activeMatch}
+                onChange={handleMatchChange}
+                onBack={() => setMode("dashboard")}
+                onPlayAgain={handlePlayAgain}
+              />
+            ) : null}
+          </div>
+        )}
       </div>
     </div>
   );
